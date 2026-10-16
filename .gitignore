@@ -1,0 +1,4 @@
+bin/
+weights/
+*.zst
+.DS_Store
