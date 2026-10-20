@@ -1,0 +1,8 @@
+weights=weights/m12_0.bin depth=0 adaptive=0 cprob=0 games=20000  time 171s  (0.01 ms/move)
+avg score 383482  max score 629364  avg moves 14171  max-tile-in-corner 95.5% of moves
+  reach   2048:  99.79% (+/- 0.06)
+  reach   4096:  99.28% (+/- 0.12)
+  reach   8192:  97.48% (+/- 0.22)
+  reach  16384:  85.93% (+/- 0.48)
+  reach  32768:  27.07% (+/- 0.62)
+  reach  65536:   0.00% (+/- 0.00)
