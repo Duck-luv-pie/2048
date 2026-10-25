@@ -37,6 +37,56 @@ With one set of weights, the 12-tuple network beats Jaśkowski's 16-stage networ
 art before Guei et al. `±` is a 95% confidence interval; our rows come from the frozen evaluations
 in [`results/`](results) (20,000 to 60,000 games each).
 
+## Architecture
+
+Four programs share two headers: the bitboard engine and the n-tuple network. Weights move between
+them as one binary file.
+
+```mermaid
+flowchart LR
+    subgraph core["shared headers"]
+        B["board.hpp<br/>bitboard engine"]
+        N["ntuple.hpp<br/>n-tuple network + presets"]
+    end
+    D[("data/init_boards.bin<br/>10k opening boards")]
+    T["bin/train<br/>CPU: init weights, TD / TC"]
+    G["bin/train_gpu<br/>GPU: 65k parallel games,<br/>minibatch TD(0)"]
+    W[("weights/*.bin<br/>float32 tables, 768 MiB")]
+    P["bin/play<br/>greedy or expectimax eval"]
+    R[("results/*.txt<br/>scores, reach rates, 95% CI")]
+
+    T -- "optimistic init (320k)" --> W
+    W -- "--load" --> G
+    D -- "--starts" --> G
+    G -- "--out (α = 0.1 → 0.01 → 0.001)" --> W
+    W -- "--weights" --> P
+    P --> R
+    core -.-> T & G & P
+```
+
+How one move is chosen (`--depth 0`):
+
+```mermaid
+flowchart LR
+    S["board s"] --> M["try UP / DOWN / LEFT / RIGHT<br/>(table-driven row moves)"]
+    M --> A["afterstate s'ₐ, reward rₐ"]
+    A --> V["V(s'ₐ) = Σ over 12 tuples × 8 symmetries<br/>of W[tuple][6 cells → 24-bit index]"]
+    V --> X["play argmaxₐ rₐ + V(s'ₐ)"]
+    X --> SP["random 2 (90%) or 4 (10%) spawns"] --> S
+```
+
+## Tech stack
+
+| | |
+|---|---|
+| Language | C++17 (engine, CPU trainer, evaluator, exact solver), CUDA C++ (GPU trainer) |
+| Build | GNU Make; any C++17 compiler (`g++`, `clang++`) |
+| Parallelism | `std::thread` + atomics on the CPU; CUDA kernels with 64-bit `atomicAdd` on the GPU |
+| Memory | 2 MiB-aligned weight tables, backed by transparent huge pages on Linux (`madvise`) |
+| Dependencies | None at runtime. `zstd` to unpack the released weights, CUDA toolkit for training on a GPU |
+| Hardware used | NVIDIA A100 for training; evaluation runs on any multi-core x86-64 or ARM CPU |
+| Figures | Hand-written SVG (`docs/`) |
+
 ## The idea: more patterns, in the right place
 
 An n-tuple network values a board by looking at it through small windows ("tuples") of 6 cells.
@@ -89,10 +139,28 @@ largest tile in a corner on 95% of moves (the 8-tuple network: 71%).
   diverging. The 12-tuple network trains at ~62M moves/s on one A100, about 45 million games in
   2.5 hours.
 
+## Key design decisions
+
+| decision | why |
+|---|---|
+| **Board = one `uint64_t`**, 16 cells × 4-bit exponents | A move is 4 lookups into precomputed 65,536-entry row tables (columns via transpose), so moves and tuple extraction are branch-free bit operations. The cost: exponent 15 (32768) is the ceiling, so merging two 32768 tiles is reported with a flag instead of stored. |
+| **Learn V(afterstate), not V(state) or Q(s,a)** | The afterstate is deterministic given the move, so choosing a move needs no sampling of tile spawns. All randomness sits in the TD target. |
+| **8-fold symmetry sampling** | Each tuple is read under all 8 rotations and reflections with *shared* weights: 8× the training signal per table and a value function that is symmetric by construction. |
+| **Tuples chosen from data, not by hand** | The 4 new tuples come from measuring where the six largest tiles sit in 9.4M late-game boards (see *The idea*), and an equal-size control set confirms that placement, not count, explains the gain. |
+| **Single stage, no search as the headline setting** | It isolates value-function quality. Staging and search both hide weaknesses in the network (see *What it doesn't do*). |
+| **Optimistic initialisation instead of ε-greedy** | Exploration comes from the weights, so training and evaluation use the same greedy policy. |
+| **Synchronous minibatch TD on the GPU** | Training is bound by random memory access, not arithmetic. Each step accumulates TD errors, then applies `W += α·D·min(1, cap/C)`. The hit count `C` and a fixed-point error sum share one 64-bit word, so a single `atomicAdd` records both, and the cap keeps a weight touched by thousands of games from overshooting. |
+| **No dependencies, frozen results** | `make` builds everything from 7 source files, and the numbers in the tables are the committed outputs in `results/`, so you can check them without retraining. |
+
 ## Quick start
 
+**Prerequisites:** a C++17 compiler and `make`. Add `zstd` to unpack the weights, and an NVIDIA GPU
+with the CUDA toolkit to train. Builds use `-march=native`, so build on the machine that runs the binaries.
+
 ```bash
+git clone https://github.com/Duck-luv-pie/2048.git && cd 2048
 make                      # bin/play, bin/train, bin/test, bin/exact  (C++17, no dependencies)
+make gpu                  # optional: bin/train_gpu (needs nvcc)
 ./bin/test                # cross-checks the bitboard engine against a naive implementation
 ```
 
@@ -111,7 +179,31 @@ avg score 382772  max score 627912  avg moves 14138  max-tile-in-corner 95.4% of
 ```
 
 `--depth 0` is pure greedy play (the paper's 1-ply). `--depth d` adds an expectimax search with `d`
-chance layers (the paper's (d+1)-ply).
+chance layers (the paper's (d+1)-ply). Note that `bin/play` defaults to `--depth 1` and 14 threads,
+so pass `--depth 0` to reproduce the no-lookahead numbers and set `--threads` for your machine.
+
+**Trace a game.** `--trace` streams every move to stdout as machine-readable lines (boards are
+64-bit hex, one nibble per cell, holding the tile's exponent), ready to pipe into a viewer or a script:
+
+```bash
+./bin/play --weights weights/m12cov_1stage.bin --depth 0 --games 1 --threads 1 --trace
+```
+
+```
+S <game> <start board>
+M <action> <afterstate> <next board after spawn> <score so far>
+E <game> <final score> <max tile> <moves>
+```
+
+Other useful flags: `--seed N` for a reproducible run, `--log games.csv` for per-game results, and
+`--starts data/init_boards.bin` to start from the training openings instead of an empty board.
+
+**Solve a small board exactly:**
+
+```bash
+./bin/exact 3 3 reach 10     # P(reaching 1024) on 3×3 under perfect play
+./bin/exact 2 4 score        # maximal expected score on 2×4
+```
 
 **Train it yourself** (needs an NVIDIA GPU and the CUDA toolkit):
 
